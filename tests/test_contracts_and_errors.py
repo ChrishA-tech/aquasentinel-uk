@@ -6,13 +6,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
+import httpx
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 from fastapi.testclient import TestClient
 from src.agents.ofwat_copilot import (
     _deterministic_fallback_node,
     calculate_statutory_penalty_exposure,
+    load_ofwat_regulatory_corpus,
     run_ofwat_compliance_copilot,
 )
 from src.analytics.river_network import (
@@ -25,14 +28,17 @@ from src.analytics.river_network import (
 from src.app.main import app
 from src.evaluation.error_analysis import generate_error_analysis_report
 from src.ingestion.hydrology_telemetry import (
+    HydrologyEDMSchema,
     ingest_hydrology_telemetry,
     pseudonymise_identifier,
 )
+from src.ingestion.live_hydrology_connectors import fetch_live_uk_ea_hydrology_and_edm
 from src.models.spill_and_vision import (
     CatchmentSpillNet,
     train_conformal_spill_models,
 )
 from src.run_pipeline import generate_synthetic_uk_telemetry
+from src.run_pipeline import main as run_pipeline_main
 
 
 def test_flatlined_corrupt_quarantine_and_gdpr_hashing(tmp_path: Path) -> None:
@@ -313,3 +319,163 @@ def test_fastapi_health_forecast_dropout_and_regulatory_audit() -> None:
     a_json = audit_resp.json()
     assert a_json["citations_verified"] is True
     assert a_json["penalty_exposure"]["compliance_status"] == "STATUTORY_BREACH"
+
+
+def _minimal_pdf_bytes(text: str) -> bytes:
+    """Create a minimal single-page PDF 1.4 byte payload readable by pypdf."""
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream = f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("latin-1")
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj\n",
+        f"4 0 obj << /Length {len(stream)} >> stream\n".encode("latin-1") + stream + b"\nendstream endobj\n",
+        b"5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+    ]
+    header = b"%PDF-1.4\n"
+    offsets = []
+    body = bytearray(header)
+    for obj in objects:
+        offsets.append(len(body))
+        body.extend(obj)
+    xref_pos = len(body)
+    body.extend(f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode("latin-1"))
+    for off in offsets:
+        body.extend(f"{off:010d} 00000 n \n".encode("latin-1"))
+    body.extend(
+        f"trailer << /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode(
+            "latin-1"
+        )
+    )
+    return bytes(body)
+
+
+def test_live_ea_hydrology_connector_mocked_and_degraded(tmp_path: Path) -> None:
+    """Live EA API connector pairs real-time gauges with CSO EDM and degrades gracefully offline."""
+
+    def _ok_handler(request: httpx.Request) -> httpx.Response:
+        param = request.url.params.get("parameter")
+        if param == "level":
+            items = [
+                {
+                    "stationReference": "THM_TEDD_01",
+                    "label": "Thames at Teddington Lock",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 2.15},
+                },
+                {
+                    "stationReference": "UUW_WARR_02",
+                    "label": "Mersey at Warrington",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 1.92},
+                },
+                {
+                    "stationReference": "SVT_WORC_03",
+                    "label": "Severn at Worcester",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 2.40},
+                },
+                {
+                    "stationReference": "YKS_BEAL_04",
+                    "label": "Aire at Beal Weir",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 1.75},
+                },
+            ]
+        else:
+            items = [
+                {
+                    "stationReference": "THM_RAIN_01",
+                    "label": "Thames Rain Gauge Reading",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 1.6},
+                },
+                {
+                    "stationReference": "YKS_RAIN_02",
+                    "label": "Aire Rain Gauge Bradford",
+                    "latestReading": {"dateTime": "2026-11-25T10:30:00Z", "value": 2.4},
+                },
+            ]
+        return httpx.Response(200, json={"items": items})
+
+    q_ok = tmp_path / "live_ok_quarantine.parquet"
+    with httpx.Client(transport=httpx.MockTransport(_ok_handler)) as mock_client:
+        live_df = fetch_live_uk_ea_hydrology_and_edm(
+            quarantine_path=q_ok,
+            n_steps_per_cso=120,
+            client=mock_client,
+        )
+
+    assert live_df.attrs["feed_status"] == "LIVE_EA_FEED_OK"
+    assert live_df.attrs["ea_level_count"] == 4
+    assert live_df.attrs["ea_rainfall_count"] == 2
+    assert q_ok.exists()
+    assert not pd.read_parquet(q_ok).empty
+    assert set(live_df["water_company_code"].unique()) == {"THM", "UUW", "SVT", "YKS"}
+    HydrologyEDMSchema.validate(live_df, lazy=False)
+
+    # Now simulate EA API outage -> graceful LIVE_EA_FEED_DEGRADED fallback
+    def _fail_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Simulated EA API outage", request=request)
+
+    q_deg = tmp_path / "degraded_quarantine.parquet"
+    with httpx.Client(transport=httpx.MockTransport(_fail_handler)) as fail_client:
+        degraded_df = fetch_live_uk_ea_hydrology_and_edm(
+            quarantine_path=q_deg,
+            n_steps_per_cso=120,
+            client=fail_client,
+        )
+
+    assert degraded_df.attrs["feed_status"] == "LIVE_EA_FEED_DEGRADED"
+    assert (degraded_df["feed_status"] == "LIVE_EA_FEED_DEGRADED").all()
+    assert q_deg.exists()
+    HydrologyEDMSchema.validate(degraded_df, lazy=False)
+
+
+def test_run_pipeline_live_degraded_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pipeline CLI `--live` falls back cleanly to LIVE_EA_FEED_DEGRADED when EA API fails."""
+
+    def _failing_fetch(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        raise httpx.ConnectError("Offline test environment")
+
+    monkeypatch.setattr(
+        "src.ingestion.live_hydrology_connectors._fetch_ea_measures",
+        _failing_fetch,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    summary = run_pipeline_main(["--live"])
+    assert summary["feed_status"] == "LIVE_EA_FEED_DEGRADED"
+    assert summary["valid_rows"] > 0
+    assert summary["quarantined_rows"] > 0
+    assert summary["copilot_verified"] is True
+    assert (tmp_path / "docs/ERROR_ANALYSIS_REPORT.md").exists()
+    assert (tmp_path / "data/quarantine/hydrology_quarantine.parquet").exists()
+
+
+def test_load_ofwat_regulatory_corpus_pdf_md_txt(tmp_path: Path) -> None:
+    """Regulatory corpus loader parses .pdf, .md, and .txt files and indexes them into hybrid RAG."""
+    (tmp_path / "ofwat_custom_rule.md").write_text(
+        "## [DISK-OFWAT-99] AMP8 Chalk Stream Buffer Rule\n"
+        "Strict AMP8 chalk stream buffer zone penalties apply to repeat CSO spills.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ea_edm_note.txt").write_text(
+        "Environment Agency 15-minute EDM telemetry must quarantine flatlined sensors immediately.",
+        encoding="utf-8",
+    )
+    (tmp_path / "environment_act_excerpt.pdf").write_bytes(
+        _minimal_pdf_bytes("Environment Act 2021 Section 141A Bathing Water Priority Discharge Plan")
+    )
+
+    corpus = load_ofwat_regulatory_corpus(docs_dir=tmp_path, include_builtin=False)
+    doc_ids = {doc.doc_id for doc in corpus}
+    assert "DISK-OFWAT-99" in doc_ids
+    assert "DISK-EA-EDM-NOTE-01" in doc_ids
+    assert "DISK-ENVIRONMENT-ACT-EXCERPT-01" in doc_ids
+    assert any("141A" in doc.text for doc in corpus)
+
+    copilot_out = run_ofwat_compliance_copilot(
+        query="What AMP8 chalk stream buffer zone penalties and Section 141A duties apply?",
+        telemetry_context={"annual_spill_count": 26, "dry_day_spills": 1, "sensitive_site": True},
+        docs_dir=tmp_path,
+    )
+    assert copilot_out["citations_verified"] is True
+    assert len(copilot_out["cited_doc_ids"]) >= 1

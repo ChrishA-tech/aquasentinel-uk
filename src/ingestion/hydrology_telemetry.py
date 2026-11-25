@@ -201,6 +201,38 @@ def _extract_failure_reasons(
     return reasons
 
 
+def persist_telemetry_duckdb(
+    valid_df: pd.DataFrame,
+    duckdb_path: str | Path = "data/processed/hydrology.duckdb",
+    table_name: str = "telemetry_15m",
+) -> Path:
+    """Persist validated telemetry DataFrame to DuckDB."""
+    duckdb_file = Path(duckdb_path)
+    duckdb_file.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(str(duckdb_file))
+    try:
+        con.register("_valid_telemetry", valid_df)
+        con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM _valid_telemetry")
+        con.unregister("_valid_telemetry")
+    finally:
+        con.close()
+    return duckdb_file
+
+
+def write_quarantine_parquet(
+    quarantine_df: pd.DataFrame,
+    quarantine_path: str | Path = "data/quarantine/hydrology_quarantine.parquet",
+) -> Path:
+    """Persist dead-letter quarantined telemetry rows to Parquet."""
+    quarantine_file = Path(quarantine_path)
+    quarantine_file.parent.mkdir(parents=True, exist_ok=True)
+    quarantine_to_write = quarantine_df.copy()
+    if "timestamp" in quarantine_to_write.columns:
+        quarantine_to_write["timestamp"] = quarantine_to_write["timestamp"].astype(str)
+    quarantine_to_write.to_parquet(quarantine_file, index=False)
+    return quarantine_file
+
+
 def ingest_hydrology_telemetry(
     df: pd.DataFrame,
     duckdb_path: str | Path = "data/processed/hydrology.duckdb",
@@ -257,19 +289,10 @@ def ingest_hydrology_telemetry(
         valid_df = HydrologyEDMSchema.validate(valid_df, lazy=False)
 
     # Persist valid telemetry to DuckDB
-    con = duckdb.connect(str(duckdb_file))
-    try:
-        con.register("_valid_telemetry", valid_df)
-        con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM _valid_telemetry")
-        con.unregister("_valid_telemetry")
-    finally:
-        con.close()
+    persist_telemetry_duckdb(valid_df, duckdb_path=duckdb_file, table_name=table_name)
 
     # Persist dead-letter quarantine to Parquet
-    quarantine_to_write = quarantine_df.copy()
-    if "timestamp" in quarantine_to_write.columns:
-        quarantine_to_write["timestamp"] = quarantine_to_write["timestamp"].astype(str)
-    quarantine_to_write.to_parquet(quarantine_file, index=False)
+    write_quarantine_parquet(quarantine_df, quarantine_file)
 
     total_rows = len(prepared)
     quarantined_rows = len(quarantine_df)

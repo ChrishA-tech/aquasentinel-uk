@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypedDict
 
 import numpy as np
 from langgraph.graph import END, START, StateGraph
+from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -109,6 +111,99 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+def _infer_framework_from_filename(path: Path) -> str:
+    stem = path.stem.lower()
+    if "ofwat" in stem or "pr24" in stem:
+        return "Ofwat PR24 Final Determinations"
+    if "environment" in stem or "141a" in stem or "act" in stem:
+        return "Environment Act 2021"
+    if "edm" in stem or "ea" in stem or "permit" in stem:
+        return "Environment Agency EDM Permitting Rules"
+    return f"UK Water Statutory Document ({path.name})"
+
+
+def _parse_markdown_sections(raw_text: str, source_path: Path) -> list[RegulatoryDocument]:
+    framework = _infer_framework_from_filename(source_path)
+    docs: list[RegulatoryDocument] = []
+    heading_pattern = re.compile(r"^##\s+(?:\[([A-Z0-9\-]+)\]\s+)?(.+)$", re.MULTILINE)
+    matches = list(heading_pattern.finditer(raw_text))
+
+    if not matches:
+        clean_text = " ".join(raw_text.split())
+        if clean_text:
+            stem_id = re.sub(r"[^A-Z0-9]+", "-", source_path.stem.upper()).strip("-")
+            docs.append(
+                RegulatoryDocument(
+                    doc_id=f"DISK-{stem_id}-01",
+                    framework=framework,
+                    section=source_path.stem,
+                    title=source_path.stem.replace("_", " ").title(),
+                    text=clean_text,
+                    keywords=tuple(_tokenize(clean_text)[:12]),
+                )
+            )
+        return docs
+
+    stem_id = re.sub(r"[^A-Z0-9]+", "-", source_path.stem.upper()).strip("-")
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw_text)
+        body = " ".join(raw_text[start:end].split())
+        if not body:
+            continue
+        doc_id = match.group(1) or f"DISK-{stem_id}-{idx + 1:02d}"
+        title = match.group(2).strip()
+        docs.append(
+            RegulatoryDocument(
+                doc_id=doc_id,
+                framework=framework,
+                section=title,
+                title=title,
+                text=body,
+                keywords=tuple(_tokenize(f"{title} {body}")[:12]),
+            )
+        )
+    return docs
+
+
+def _extract_pdf_text(pdf_path: Path) -> str:
+    reader = PdfReader(str(pdf_path))
+    pages = [page.extract_text() or "" for page in reader.pages]
+    return "\n".join(pages).strip()
+
+
+def load_ofwat_regulatory_corpus(
+    docs_dir: Path = Path("data/regulatory_docs"),
+    include_builtin: bool = True,
+) -> tuple[RegulatoryDocument, ...]:
+    """Load `.pdf`, `.md`, and `.txt` regulatory docs from disk and merge with statutory corpus."""
+    by_id: dict[str, RegulatoryDocument] = {}
+    if include_builtin:
+        for doc in REGULATORY_CORPUS:
+            by_id[doc.doc_id] = doc
+
+    dir_path = Path(docs_dir)
+    if dir_path.exists() and dir_path.is_dir():
+        supported_files = sorted(
+            p
+            for p in dir_path.iterdir()
+            if p.is_file() and p.suffix.lower() in {".md", ".txt", ".pdf"}
+        )
+        for file_path in supported_files:
+            suffix = file_path.suffix.lower()
+            if suffix == ".pdf":
+                raw_text = _extract_pdf_text(file_path)
+                parsed_docs = _parse_markdown_sections(raw_text, file_path)
+            else:
+                raw_text = file_path.read_text(encoding="utf-8")
+                parsed_docs = _parse_markdown_sections(raw_text, file_path)
+
+            for doc in parsed_docs:
+                by_id[doc.doc_id] = doc
+
+    return tuple(by_id.values())
+
+
 class HybridRegulatoryRetriever:
     """Hybrid BM25 + TF-IDF cosine retriever over UK water statutory documents."""
 
@@ -199,6 +294,7 @@ class CopilotState(TypedDict):
 
     query: str
     telemetry_context: dict[str, Any]
+    docs_dir: str | None
     guardrail_passed: bool
     guardrail_reason: str
     retrieved_docs: list[dict[str, Any]]
@@ -210,8 +306,9 @@ class CopilotState(TypedDict):
     final_answer: str
 
 
-_RETRIEVER = HybridRegulatoryRetriever()
-_VALID_DOC_IDS = {doc.doc_id for doc in REGULATORY_CORPUS}
+_DEFAULT_CORPUS = load_ofwat_regulatory_corpus(Path("data/regulatory_docs"))
+_RETRIEVER = HybridRegulatoryRetriever(_DEFAULT_CORPUS)
+_VALID_DOC_IDS = {doc.doc_id for doc in _DEFAULT_CORPUS}
 _BLOCKED_PATTERNS = re.compile(
     r"(ignore previous instructions|bypass|jailbreak|drop table|rm -rf|<script>)",
     re.IGNORECASE,
@@ -238,7 +335,13 @@ def _route_after_guardrail(state: CopilotState) -> str:
 
 
 def _retrieve_node(state: CopilotState) -> dict[str, Any]:
-    hits = _RETRIEVER.retrieve(state["query"], top_k=3)
+    docs_dir = state.get("docs_dir")
+    retriever = (
+        HybridRegulatoryRetriever(load_ofwat_regulatory_corpus(Path(docs_dir)))
+        if docs_dir
+        else _RETRIEVER
+    )
+    hits = retriever.retrieve(state["query"], top_k=3)
     docs_payload = [
         {
             "doc_id": doc.doc_id,
@@ -296,6 +399,7 @@ def _citation_verifier_node(state: CopilotState) -> dict[str, Any]:
     draft = state.get("draft_answer", "")
     retrieved_ids = {d["doc_id"] for d in state.get("retrieved_docs", [])}
     cited_in_text = re.findall(r"\[([A-Z0-9\-]+)\]", draft)
+    valid_ids = _VALID_DOC_IDS | retrieved_ids
 
     if not cited_in_text:
         return {
@@ -303,7 +407,7 @@ def _citation_verifier_node(state: CopilotState) -> dict[str, Any]:
             "verification_notes": "No inline statutory citations found in draft.",
         }
 
-    invalid = [cid for cid in cited_in_text if cid not in _VALID_DOC_IDS or cid not in retrieved_ids]
+    invalid = [cid for cid in cited_in_text if cid not in valid_ids or cid not in retrieved_ids]
     if invalid:
         return {
             "citations_verified": False,
@@ -384,12 +488,14 @@ def build_ofwat_copilot_graph():
 def run_ofwat_compliance_copilot(
     query: str,
     telemetry_context: dict[str, Any] | None = None,
+    docs_dir: Path | str | None = None,
 ) -> CopilotState:
     """Execute the Ofwat PR24 / Environment Act 2021 compliance copilot."""
     app = build_ofwat_copilot_graph()
     initial_state: CopilotState = {
         "query": query,
         "telemetry_context": telemetry_context or {},
+        "docs_dir": str(docs_dir) if docs_dir is not None else None,
         "guardrail_passed": True,
         "guardrail_reason": "",
         "retrieved_docs": [],

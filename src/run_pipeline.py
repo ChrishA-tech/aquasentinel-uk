@@ -1,7 +1,8 @@
-"""End-to-end AquaSentinel UK synthetic data generator and pipeline runner."""
+"""End-to-end AquaSentinel UK live/offline data ingestion and pipeline runner."""
 
 from __future__ import annotations
 
+import argparse
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,11 @@ import pandas as pd
 from src.agents.ofwat_copilot import run_ofwat_compliance_copilot
 from src.analytics.river_network import build_uk_river_network, detect_dry_weather_spills
 from src.evaluation.error_analysis import generate_error_analysis_report
-from src.ingestion.hydrology_telemetry import ingest_hydrology_telemetry
+from src.ingestion.hydrology_telemetry import (
+    ingest_hydrology_telemetry,
+    persist_telemetry_duckdb,
+)
+from src.ingestion.live_hydrology_connectors import fetch_live_uk_ea_hydrology_and_edm
 from src.models.spill_and_vision import train_conformal_spill_models
 
 STATION_CATALOG: tuple[dict[str, str], ...] = (
@@ -185,17 +190,34 @@ def generate_synthetic_uk_telemetry(
     return df
 
 
-def run_pipeline() -> dict[str, Any]:
+def run_pipeline(live: bool = True) -> dict[str, Any]:
     """Execute end-to-end ingestion, network analytics, model training, evaluation, and copilot check."""
     raw_dir = Path("data/raw")
     raw_dir.mkdir(parents=True, exist_ok=True)
-    raw_df = generate_synthetic_uk_telemetry()
     raw_csv_path = raw_dir / "uk_hydrology_edm_15m.csv"
-    raw_df.to_csv(raw_csv_path, index=False)
 
-    ingestion = ingest_hydrology_telemetry(raw_df)
+    if live:
+        valid_df = fetch_live_uk_ea_hydrology_and_edm()
+        valid_df.to_csv(raw_csv_path, index=False)
+        persist_telemetry_duckdb(valid_df)
+        feed_status = str(valid_df.attrs.get("feed_status", "LIVE_EA_FEED_OK"))
+        total_raw_rows = int(valid_df.attrs.get("raw_rows", len(valid_df)))
+        valid_rows = len(valid_df)
+        quarantined_rows = int(valid_df.attrs.get("quarantined_rows", 0))
+        quarantine_rate = (quarantined_rows / total_raw_rows) if total_raw_rows > 0 else 0.0
+    else:
+        raw_df = generate_synthetic_uk_telemetry()
+        raw_df.to_csv(raw_csv_path, index=False)
+        ingestion = ingest_hydrology_telemetry(raw_df)
+        valid_df = ingestion.valid_df
+        feed_status = "OFFLINE_SYNTHETIC"
+        total_raw_rows = ingestion.total_rows
+        valid_rows = ingestion.valid_rows
+        quarantined_rows = ingestion.quarantined_rows
+        quarantine_rate = ingestion.quarantine_rate
+
     graph = build_uk_river_network()
-    enriched_df = detect_dry_weather_spills(ingestion.valid_df, graph=graph)
+    enriched_df = detect_dry_weather_spills(valid_df, graph=graph)
 
     suite = train_conformal_spill_models(enriched_df)
     report_path = generate_error_analysis_report(suite.feature_df)
@@ -212,15 +234,16 @@ def run_pipeline() -> dict[str, Any]:
             "total_spill_hours": 115.0,
             "dry_day_spills": max(1, dry_spills_detected),
             "sensitive_site": True,
-            "edm_uptime_pct": 100.0 * (1.0 - ingestion.quarantine_rate),
+            "edm_uptime_pct": 100.0 * (1.0 - quarantine_rate),
         },
     )
 
     summary = {
-        "total_raw_rows": ingestion.total_rows,
-        "valid_rows": ingestion.valid_rows,
-        "quarantined_rows": ingestion.quarantined_rows,
-        "quarantine_rate": round(ingestion.quarantine_rate, 4),
+        "feed_status": feed_status,
+        "total_raw_rows": total_raw_rows,
+        "valid_rows": valid_rows,
+        "quarantined_rows": quarantined_rows,
+        "quarantine_rate": round(quarantine_rate, 4),
         "dry_day_spills_detected": dry_spills_detected,
         "mlflow_run_id": suite.mlflow_run_id,
         "horizon_metrics": {h: res.metrics for h, res in suite.horizon_results.items()},
@@ -232,8 +255,23 @@ def run_pipeline() -> dict[str, Any]:
     return summary
 
 
-if __name__ == "__main__":
-    result = run_pipeline()
+def main(argv: list[str] | None = None) -> dict[str, Any]:
+    parser = argparse.ArgumentParser(
+        description="Run the AquaSentinel UK telemetry, forecasting, and Ofwat compliance pipeline."
+    )
+    parser.add_argument(
+        "--live",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fetch live UK Environment Agency hydrology telemetry (with offline fallback).",
+    )
+    args = parser.parse_args(argv)
+    result = run_pipeline(live=args.live)
     print("=== AquaSentinel UK Pipeline Complete ===")
     for key, value in result.items():
         print(f"{key}: {value}")
+    return result
+
+
+if __name__ == "__main__":
+    main()
