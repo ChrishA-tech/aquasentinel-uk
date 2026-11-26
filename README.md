@@ -66,3 +66,8 @@ Services:
 - `pgvector`: PostgreSQL 16 + `pgvector` on port `5432`
 - `mlflow`: MLflow tracking server backed by `sqlite:///mlruns/mlflow.db` on port `5000`
 - `api`: FastAPI service on port `8000`
+
+
+## Interactive decision replay
+
+Explore [the dashboard](https://chrisha-tech.github.io/replay/?project=aquasentinel-uk) or reproduce the [scenario benchmark and error analysis](replay/README.md). The bundled replay uses synthetic scenarios.

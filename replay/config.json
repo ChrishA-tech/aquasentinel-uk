@@ -1,0 +1,16 @@
+{
+  "slug": "aquasentinel-uk",
+  "name": "AquaSentinel UK",
+  "domain": "Catchment monitoring",
+  "subtitle": "Compare spill-probability estimates across rainfall and sensor scenarios.",
+  "units": "Brier score",
+  "baseline": "Rain threshold",
+  "candidate": "Scenario estimate",
+  "stress": "Heavy rainfall",
+  "groups": [
+    "Upper basin",
+    "Middle basin",
+    "Lower basin"
+  ],
+  "note": "Spill events and probabilities are simulated from rainfall scenarios. This does not measure regulatory breaches, pollution outcomes or warning lead time on observed spills."
+}
