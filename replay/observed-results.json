@@ -1,0 +1,85 @@
+{
+  "source": "Environment Agency 2025 detailed EDM start/stop archive, United Utilities",
+  "metric": "Brier score for a recorded spill start on a UTC site-day",
+  "baseline": "Previous day's binary recorded-start flag",
+  "candidate": "Previous 28 days' recorded-start rate",
+  "eligible_monitors": 661,
+  "invalid_source_rows": 1,
+  "recorded_start_rate": 0.20366,
+  "holdout": [
+    "2025-07-01",
+    "2025-12-31"
+  ],
+  "metrics": {
+    "cases": 121624,
+    "baseline_loss": 0.23756,
+    "candidate_loss": 0.154043,
+    "candidate_wins": 28352,
+    "baseline_wins": 83467,
+    "ties": 9805,
+    "largest_candidate_disadvantage": 0.929847,
+    "worst_case": "(Timestamp('2025-07-07 00:00:00+0000', tz='UTC'), 'UUP00226')"
+  },
+  "by_month": {
+    "2025-07": {
+      "cases": 20491,
+      "baseline_loss": 0.173052,
+      "candidate_loss": 0.098762,
+      "candidate_wins": 3472,
+      "baseline_wins": 15261,
+      "ties": 1758,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-07-07 00:00:00+0000', tz='UTC'), 'UUP00226')"
+    },
+    "2025-08": {
+      "cases": 20491,
+      "baseline_loss": 0.088234,
+      "candidate_loss": 0.054022,
+      "candidate_wins": 1753,
+      "baseline_wins": 15547,
+      "ties": 3191,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-08-04 00:00:00+0000', tz='UTC'), 'UUP00247')"
+    },
+    "2025-09": {
+      "cases": 19830,
+      "baseline_loss": 0.333888,
+      "candidate_loss": 0.215856,
+      "candidate_wins": 6322,
+      "baseline_wins": 11129,
+      "ties": 2379,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-09-01 00:00:00+0000', tz='UTC'), 'UUP00695')"
+    },
+    "2025-10": {
+      "cases": 20491,
+      "baseline_loss": 0.197843,
+      "candidate_loss": 0.146736,
+      "candidate_wins": 4038,
+      "baseline_wins": 15767,
+      "ties": 686,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-10-02 00:00:00+0000', tz='UTC'), 'UUP00312')"
+    },
+    "2025-11": {
+      "cases": 19830,
+      "baseline_loss": 0.368633,
+      "candidate_loss": 0.225491,
+      "candidate_wins": 7224,
+      "baseline_wins": 11609,
+      "ties": 997,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-11-02 00:00:00+0000', tz='UTC'), 'UUP00132')"
+    },
+    "2025-12": {
+      "cases": 20491,
+      "baseline_loss": 0.271046,
+      "candidate_loss": 0.187688,
+      "candidate_wins": 5543,
+      "baseline_wins": 14154,
+      "ties": 794,
+      "largest_candidate_disadvantage": 0.929847,
+      "worst_case": "(Timestamp('2025-12-02 00:00:00+0000', tz='UTC'), 'UUP01616')"
+    }
+  }
+}
